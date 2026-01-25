@@ -1,8 +1,17 @@
 import jwt from "jsonwebtoken";
 import path from "path";
+import { validateUrl } from "./src/utils/url-validator.js";
 
-const GHOST_URL = "https://matthewclapp.com";
-const GHOST_API_KEY = "bb4d6377764d99b2a406149e:da704954f40a155e9ea765d079782db193943a3bbcdf9f6f76f2077665d0176a";
+// Require environment variables - no hardcoded credentials
+const GHOST_URL = process.env.GHOST_URL;
+const GHOST_API_KEY = process.env.GHOST_ADMIN_API_KEY;
+
+if (!GHOST_URL || !GHOST_API_KEY) {
+  console.error("ERROR: Required environment variables not set");
+  console.error("  GHOST_URL - Your Ghost site URL");
+  console.error("  GHOST_ADMIN_API_KEY - Your Ghost Admin API key");
+  process.exit(1);
+}
 
 const [keyId, secret] = GHOST_API_KEY.split(":");
 
@@ -73,6 +82,13 @@ async function updatePost(postId, html, updatedAt) {
 
 async function downloadImage(url) {
   try {
+    // SSRF protection: validate URL before fetching
+    const urlCheck = validateUrl(url);
+    if (!urlCheck.valid) {
+      console.log(`    URL blocked: ${urlCheck.reason}`);
+      return null;
+    }
+
     const response = await fetch(url, {
       headers: {
         "User-Agent": "Mozilla/5.0 (compatible; GhostMigration/1.0)",
@@ -82,6 +98,15 @@ async function downloadImage(url) {
 
     if (!response.ok) {
       return null;
+    }
+
+    // Validate final URL after redirects
+    if (response.url !== url) {
+      const redirectCheck = validateUrl(response.url);
+      if (!redirectCheck.valid) {
+        console.log(`    Redirect blocked: ${redirectCheck.reason}`);
+        return null;
+      }
     }
 
     const contentType = response.headers.get("content-type") || "image/jpeg";

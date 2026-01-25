@@ -1,6 +1,7 @@
 import jwt from "jsonwebtoken";
 import config from "../config.js";
 import crypto from "crypto";
+import { sanitizeFilename } from "../utils/sanitize.js";
 
 export class GhostClient {
   constructor() {
@@ -69,12 +70,15 @@ export class GhostClient {
     const url = `${this.baseUrl}/ghost/api/admin/images/upload/`;
     const token = this.generateToken();
 
+    // Sanitize filename to prevent header injection
+    const safeFilename = sanitizeFilename(filename);
+
     const boundary = "----FormBoundary" + crypto.randomBytes(16).toString("hex");
 
-    const contentType = this.getMimeType(filename);
+    const contentType = this.getMimeType(safeFilename);
     const header = Buffer.from(
       `--${boundary}\r\n` +
-      `Content-Disposition: form-data; name="file"; filename="${filename}"\r\n` +
+      `Content-Disposition: form-data; name="file"; filename="${safeFilename}"\r\n` +
       `Content-Type: ${contentType}\r\n\r\n`
     );
     const footer = Buffer.from(`\r\n--${boundary}--\r\n`);

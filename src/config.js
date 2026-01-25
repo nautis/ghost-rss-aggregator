@@ -1,7 +1,20 @@
+// Validate required environment variables
+if (!process.env.GHOST_ADMIN_API_KEY) {
+  console.error("ERROR: GHOST_ADMIN_API_KEY environment variable is required");
+  console.error("Set it with: export GHOST_ADMIN_API_KEY='your-key-id:your-secret'");
+  process.exit(1);
+}
+
+if (!process.env.GHOST_URL) {
+  console.error("ERROR: GHOST_URL environment variable is required");
+  console.error("Set it with: export GHOST_URL='https://your-ghost-site.com'");
+  process.exit(1);
+}
+
 export default {
-  ghostUrl: process.env.GHOST_URL || "https://tellingtime.com",
-  ghostAdminApiKey: process.env.GHOST_ADMIN_API_KEY || "bb4d6377764d99b2a406149e:da704954f40a155e9ea765d079782db193943a3bbcdf9f6f76f2077665d0176a",
-  dbPath: process.env.DB_PATH || "/opt/rss-aggregator/data/aggregator.db",
+  ghostUrl: process.env.GHOST_URL,
+  ghostAdminApiKey: process.env.GHOST_ADMIN_API_KEY,
+  dbPath: process.env.DB_PATH || "./data/aggregator.db",
   
   // Cron schedule (default: every 30 minutes)
   fetchInterval: process.env.FETCH_INTERVAL || "*/30 * * * *",

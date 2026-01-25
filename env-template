@@ -1,0 +1,15 @@
+# Ghost RSS Aggregator Configuration
+# Copy this file to .env and fill in your values
+
+# Required: Ghost Admin API URL
+GHOST_URL=https://your-ghost-site.com
+
+# Required: Ghost Admin API Key (from Ghost Admin > Settings > Integrations)
+# Format: key-id:secret
+GHOST_ADMIN_API_KEY=your-key-id:your-secret-hex-string
+
+# Optional: Database path (defaults to ./data/aggregator.db)
+DB_PATH=./data/aggregator.db
+
+# Optional: Cron schedule for fetching (defaults to every 30 minutes)
+FETCH_INTERVAL=*/30 * * * *

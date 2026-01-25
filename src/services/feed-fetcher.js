@@ -3,6 +3,8 @@ import crypto from "crypto";
 import db from "../db.js";
 import ghostClient from "./ghost-client.js";
 import config from "../config.js";
+import { assertUrlSafe, validateUrl } from "../utils/url-validator.js";
+import { escapeHtml, stripHtml } from "../utils/sanitize.js";
 
 const parser = new Parser({
   headers: {
@@ -52,6 +54,9 @@ export class FeedFetcher {
     let itemsSkipped = 0;
 
     try {
+      // SSRF protection: validate feed URL before fetching
+      assertUrlSafe(feedSource.feed_url);
+
       const feed = await parser.parseURL(feedSource.feed_url);
       // Limit to most recent 10 items per feed to avoid timeouts
       const items = feed.items.slice(0, 10);
@@ -176,8 +181,9 @@ export class FeedFetcher {
     const content = item.content || item.contentSnippet || item.summary || "";
     const excerpt = this.createExcerpt(content, 300);
 
-    // Minimal HTML - just the excerpt since we're linking externally
-    const html = `<p>${excerpt}</p>`;
+    // Minimal HTML - escape excerpt to prevent XSS
+    const safeExcerpt = escapeHtml(excerpt);
+    const html = `<p>${safeExcerpt}</p>`;
 
     const postData = {
       title: item.title,
@@ -240,9 +246,8 @@ export class FeedFetcher {
   }
 
   async uploadImageToGhost(imageUrl) {
-    if (!imageUrl.startsWith("http://") && !imageUrl.startsWith("https://")) {
-      throw new Error("Invalid image URL scheme");
-    }
+    // SSRF protection: validate image URL before fetching
+    assertUrlSafe(imageUrl);
 
     const response = await fetch(imageUrl, {
       headers: {
@@ -253,6 +258,14 @@ export class FeedFetcher {
       redirect: "follow",
       signal: AbortSignal.timeout(config.imageTimeout),
     });
+
+    // SSRF protection: validate final URL after redirects
+    if (response.url !== imageUrl) {
+      const redirectCheck = validateUrl(response.url);
+      if (!redirectCheck.valid) {
+        throw new Error(`Redirect blocked: ${redirectCheck.reason}`);
+      }
+    }
 
     if (!response.ok) {
       throw new Error(`Failed to download image: ${response.status}`);

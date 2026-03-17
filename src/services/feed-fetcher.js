@@ -195,6 +195,7 @@ export class FeedFetcher {
       published_at: item.isoDate || new Date().toISOString(),  // Use ISO format (Ghost rejects RFC 2822)
       authors: [{ id: authorId }],  // Set author to the news source (Ghost needs object format)
       tags: [
+        { slug: "news" },
         { slug: feedSource.default_tag_slug || config.defaultTagSlug },
         { slug: this.slugify(feedSource.name) }
       ],

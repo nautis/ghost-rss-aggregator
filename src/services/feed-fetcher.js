@@ -66,18 +66,20 @@ export class FeedFetcher {
       // Ensure we have an author for this feed source
       const authorId = await this.ensureAuthor(feedSource.name);
 
-      // Check local DB for already-imported URLs
+      // Check local DB for already-imported URLs (across ALL feeds, not just this one)
       const existingUrls = new Set(
-        db.prepare("SELECT item_url FROM imported_items WHERE feed_source_id = ?")
-          .all(feedSource.id)
-          .map(row => row.item_url)
+        db.prepare("SELECT item_url FROM imported_items")
+          .all()
+          .map(row => this.normalizeUrl(row.item_url))
       );
 
-      // Also check Ghost for existing posts with same canonical_url (prevents dupes if local DB cleared)
+      // Also check Ghost for existing posts by canonical_url AND title (prevents dupes if local DB cleared)
+      const existingTitles = new Set();
       try {
-        const ghostPosts = await ghostClient.request("GET", "/posts/?filter=tag:news&limit=all&fields=canonical_url");
+        const ghostPosts = await ghostClient.request("GET", "/posts/?filter=tag:news&limit=all&fields=canonical_url,title");
         ghostPosts.posts.forEach(p => {
-          if (p.canonical_url) existingUrls.add(p.canonical_url);
+          if (p.canonical_url) existingUrls.add(this.normalizeUrl(p.canonical_url));
+          if (p.title) existingTitles.add(p.title.trim().toLowerCase());
         });
       } catch (e) {
         console.log("  Warning: Could not fetch existing Ghost posts for dedup check");
@@ -86,7 +88,10 @@ export class FeedFetcher {
       for (const item of items) {
         try {
           const itemUrl = item.link || item.guid;
-          if (!itemUrl || existingUrls.has(itemUrl)) {
+          const normalizedUrl = itemUrl ? this.normalizeUrl(itemUrl) : null;
+          const itemTitle = (item.title || "").trim().toLowerCase();
+
+          if (!itemUrl || existingUrls.has(normalizedUrl) || existingTitles.has(itemTitle)) {
             itemsSkipped++;
             continue;
           }
@@ -117,7 +122,8 @@ export class FeedFetcher {
               item.pubDate || item.isoDate || null
             );
 
-            existingUrls.add(itemUrl);
+            existingUrls.add(normalizedUrl);
+            if (itemTitle) existingTitles.add(itemTitle);
             itemsImported++;
             console.log(`  Imported: ${item.title?.substring(0, 50)}...`);
           }
@@ -358,6 +364,27 @@ export class FeedFetcher {
   hashContent(item) {
     const content = `${item.title || ""}|${item.link || ""}`;
     return crypto.createHash("sha256").update(content).digest("hex").substring(0, 32);
+  }
+
+  normalizeUrl(url) {
+    try {
+      const u = new URL(url);
+      // Remove trailing slash, fragment, and common tracking params
+      u.hash = "";
+      u.searchParams.delete("utm_source");
+      u.searchParams.delete("utm_medium");
+      u.searchParams.delete("utm_campaign");
+      u.searchParams.delete("utm_content");
+      u.searchParams.delete("utm_term");
+      let normalized = u.toString();
+      // Remove trailing slash (but not for root paths)
+      if (normalized.endsWith("/") && u.pathname !== "/") {
+        normalized = normalized.slice(0, -1);
+      }
+      return normalized;
+    } catch {
+      return url;
+    }
   }
 
   slugify(text) {

@@ -1,4 +1,7 @@
 import Parser from "rss-parser";
+import { parseFeed as htmlParseFeed } from "htmlparser2";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import crypto from "crypto";
 import db from "../db.js";
 import ghostClient from "./ghost-client.js";
@@ -6,11 +9,9 @@ import config from "../config.js";
 import { assertUrlSafe, validateUrl } from "../utils/url-validator.js";
 import { escapeHtml, stripHtml } from "../utils/sanitize.js";
 
+const execFileAsync = promisify(execFile);
+
 const parser = new Parser({
-  headers: {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/rss+xml, application/xml, text/xml, application/atom+xml, */*;q=0.8",
-  },
   customFields: {
     item: [
       ["media:content", "mediaContent", { keepArray: true }],
@@ -57,7 +58,7 @@ export class FeedFetcher {
       // SSRF protection: validate feed URL before fetching
       assertUrlSafe(feedSource.feed_url);
 
-      const feed = await parser.parseURL(feedSource.feed_url);
+      const feed = await this.fetchAndParseFeed(feedSource.feed_url);
       // Limit to most recent 10 items per feed to avoid timeouts
       const items = feed.items.slice(0, 10);
       itemsFound = items.length;
@@ -364,6 +365,39 @@ export class FeedFetcher {
   hashContent(item) {
     const content = `${item.title || ""}|${item.link || ""}`;
     return crypto.createHash("sha256").update(content).digest("hex").substring(0, 32);
+  }
+
+  async fetchAndParseFeed(url) {
+    // Use curl to fetch RSS — Node's HTTP stack gets TLS-fingerprinted and blocked
+    // by Cloudflare/WAFs on some sites, while curl passes through fine.
+    const { stdout } = await execFileAsync("curl", [
+      "-sS",
+      "-L",                    // follow redirects
+      "--max-time", "30",
+      "-H", "User-Agent: Ghost-RSS-Aggregator/1.1",
+      url,
+    ], { maxBuffer: 10 * 1024 * 1024 });
+
+    // Try rss-parser first (richer field extraction), fall back to htmlparser2
+    // for feeds with malformed XML that sax rejects
+    try {
+      return await parser.parseString(stdout);
+    } catch {
+      console.log("  rss-parser failed, falling back to htmlparser2");
+      const feed = htmlParseFeed(stdout);
+      if (!feed) throw new Error("Feed could not be parsed by either rss-parser or htmlparser2");
+      return {
+        items: (feed.items || []).map(item => ({
+          title: item.title,
+          link: item.link,
+          guid: item.id || item.link,
+          pubDate: item.pubDate?.toISOString?.() || item.pubDate,
+          isoDate: item.pubDate?.toISOString?.() || item.pubDate,
+          content: item.description || "",
+          contentSnippet: item.description?.replace(/<[^>]*>/g, "").substring(0, 300) || "",
+        })),
+      };
+    }
   }
 
   normalizeUrl(url) {

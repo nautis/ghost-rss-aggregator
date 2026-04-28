@@ -11,8 +11,12 @@ if (!fs.existsSync(dataDir)) {
 
 const db = new Database(config.dbPath);
 
-// Enable foreign keys
+// WAL allows concurrent readers (e.g. CLI `list`/`stats`/`logs` while the
+// daemon is mid-write) without blocking. Foreign keys must be enabled per
+// connection in SQLite.
+db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
+db.pragma("synchronous = NORMAL");
 
 // Initialize schema
 db.exec(`

@@ -1,15 +1,20 @@
 import Parser from "rss-parser";
 import { parseFeed as htmlParseFeed } from "htmlparser2";
+import { decodeHTML } from "entities";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import crypto from "crypto";
 import db from "../db.js";
 import ghostClient from "./ghost-client.js";
 import config from "../config.js";
-import { assertUrlSafe, validateUrl } from "../utils/url-validator.js";
-import { escapeHtml, stripHtml } from "../utils/sanitize.js";
+import { assertResolvedUrlSafe } from "../utils/url-validator.js";
+import { escapeHtml } from "../utils/sanitize.js";
 
 const execFileAsync = promisify(execFile);
+
+const MAX_REDIRECTS = 3;
+const MAX_FEED_BYTES = 10 * 1024 * 1024;       // 10MB cap on a single feed body
+const MAX_FEED_ITEMS_PARSED = 200;             // sanity ceiling before slice(0,10)
 
 const parser = new Parser({
   customFields: {
@@ -22,6 +27,31 @@ const parser = new Parser({
     ],
   },
 });
+
+/**
+ * Sniff the first bytes of a buffer to confirm it's actually an image. We don't
+ * trust server Content-Type headers — a malicious feed can serve HTML/JS under
+ * `image/jpeg` and Ghost would happily store and re-serve it under our domain.
+ * Returns the detected type or null.
+ */
+function sniffImageType(buf) {
+  if (buf.length < 12) return null;
+
+  // SVG / XML — text-based, easy to disguise as anything. Reject by name below;
+  // here we just detect so the caller can refuse.
+  const head = buf.slice(0, 256).toString("utf8").trimStart().toLowerCase();
+  if (head.startsWith("<?xml") || head.startsWith("<svg")) return "svg";
+
+  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return "jpeg";
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47 &&
+      buf[4] === 0x0D && buf[5] === 0x0A && buf[6] === 0x1A && buf[7] === 0x0A) return "png";
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38 &&
+      (buf[4] === 0x37 || buf[4] === 0x39) && buf[5] === 0x61) return "gif";
+  if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+      buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return "webp";
+
+  return null;
+}
 
 export class FeedFetcher {
   constructor() {
@@ -55,44 +85,35 @@ export class FeedFetcher {
     let itemsSkipped = 0;
 
     try {
-      // SSRF protection: validate feed URL before fetching
-      assertUrlSafe(feedSource.feed_url);
-
       const feed = await this.fetchAndParseFeed(feedSource.feed_url);
-      // Limit to most recent 10 items per feed to avoid timeouts
       const items = feed.items.slice(0, 10);
       itemsFound = items.length;
       console.log(`  Found ${feed.items.length} items, processing ${itemsFound}`);
 
-      // Ensure we have an author for this feed source
       const authorId = await this.ensureAuthor(feedSource.name);
 
-      // Check local DB for already-imported URLs (across ALL feeds, not just this one)
       const existingUrls = new Set(
         db.prepare("SELECT item_url FROM imported_items")
           .all()
           .map(row => this.normalizeUrl(row.item_url))
       );
 
-      // Also check Ghost for existing posts by canonical_url AND title (prevents dupes if local DB cleared)
-      const existingTitles = new Set();
-      try {
-        const ghostPosts = await ghostClient.request("GET", "/posts/?filter=tag:news&limit=all&fields=canonical_url,title");
-        ghostPosts.posts.forEach(p => {
-          if (p.canonical_url) existingUrls.add(this.normalizeUrl(p.canonical_url));
-          if (p.title) existingTitles.add(p.title.trim().toLowerCase());
-        });
-      } catch (e) {
-        console.log("  Warning: Could not fetch existing Ghost posts for dedup check");
-      }
+      // Local DB is the source of truth for dedup (unique index on item_url).
+      // We no longer pull every Ghost post tagged 'news' — that grew O(n) per cycle.
 
       for (const item of items) {
         try {
           const itemUrl = item.link || item.guid;
           const normalizedUrl = itemUrl ? this.normalizeUrl(itemUrl) : null;
-          const itemTitle = (item.title || "").trim().toLowerCase();
 
-          if (!itemUrl || existingUrls.has(normalizedUrl) || existingTitles.has(itemTitle)) {
+          if (!itemUrl || existingUrls.has(normalizedUrl)) {
+            itemsSkipped++;
+            continue;
+          }
+
+          // canonical_url is rendered by Ghost — refuse anything that isn't http(s)
+          if (item.link && !isSafeCanonicalLink(item.link)) {
+            console.log(`  Skipping item with unsafe link: ${item.title?.substring(0, 50)}`);
             itemsSkipped++;
             continue;
           }
@@ -100,8 +121,7 @@ export class FeedFetcher {
           if (feedSource.keyword_filter) {
             const keywords = feedSource.keyword_filter.split(",").map(k => k.trim().toLowerCase());
             const content = `${item.title || ""} ${item.contentSnippet || ""}`.toLowerCase();
-            const hasKeyword = keywords.some(kw => content.includes(kw));
-            if (!hasKeyword) {
+            if (!keywords.some(kw => content.includes(kw))) {
               itemsSkipped++;
               continue;
             }
@@ -109,22 +129,26 @@ export class FeedFetcher {
 
           const ghostPost = await this.importItem(item, feedSource, authorId);
           if (ghostPost) {
-            db.prepare(`
-              INSERT INTO imported_items
-              (feed_source_id, item_guid, item_url, content_hash, ghost_post_id, original_title, original_pub_date)
-              VALUES (?, ?, ?, ?, ?, ?, ?)
-            `).run(
-              feedSource.id,
-              item.guid || null,
-              itemUrl,
-              this.hashContent(item),
-              ghostPost.id,
-              item.title,
-              item.pubDate || item.isoDate || null
-            );
+            try {
+              db.prepare(`
+                INSERT INTO imported_items
+                (feed_source_id, item_guid, item_url, content_hash, ghost_post_id, original_title, original_pub_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+              `).run(
+                feedSource.id,
+                item.guid || null,
+                itemUrl,
+                this.hashContent(item),
+                ghostPost.id,
+                item.title,
+                item.pubDate || item.isoDate || null
+              );
+            } catch (insertErr) {
+              // UNIQUE violation = race with concurrent fetch; not fatal
+              if (!insertErr.message?.includes("UNIQUE")) throw insertErr;
+            }
 
             existingUrls.add(normalizedUrl);
-            if (itemTitle) existingTitles.add(itemTitle);
             itemsImported++;
             console.log(`  Imported: ${item.title?.substring(0, 50)}...`);
           }
@@ -156,11 +180,7 @@ export class FeedFetcher {
   }
 
   async ensureAuthor(sourceName) {
-    // Check cache first
-    if (this.authorCache.has(sourceName)) {
-      return this.authorCache.get(sourceName);
-    }
-
+    if (this.authorCache.has(sourceName)) return this.authorCache.get(sourceName);
     const authorId = await ghostClient.ensureAuthor(sourceName);
     this.authorCache.set(sourceName, authorId);
     return authorId;
@@ -177,7 +197,9 @@ export class FeedFetcher {
         console.log(`    Image uploaded: ${featureImageUrl}`);
       } catch (imgError) {
         console.log(`    Image failed: ${imgError.message}`);
-        // Try to use the original URL directly as a fallback
+        // Fallback: only re-use the original URL if we already validated its scheme
+        // and it's HTTPS. This means hot-linking, which we accept as a documented
+        // tradeoff vs. losing the image.
         if (imageUrl.startsWith("https://")) {
           featureImageUrl = imageUrl;
           console.log(`    Using original image URL as fallback`);
@@ -187,24 +209,22 @@ export class FeedFetcher {
 
     const content = item.content || item.contentSnippet || item.summary || "";
     const excerpt = this.createExcerpt(content, 300);
-
-    // Minimal HTML - escape excerpt to prevent XSS
     const safeExcerpt = escapeHtml(excerpt);
     const html = `<p>${safeExcerpt}</p>`;
 
     const postData = {
       title: item.title,
-      html: html,
+      html,
       status: feedSource.post_status || config.defaultPostStatus,
       feature_image: featureImageUrl,
       custom_excerpt: excerpt,
       canonical_url: item.link,
-      published_at: item.isoDate || new Date().toISOString(),  // Use ISO format (Ghost rejects RFC 2822)
-      authors: [{ id: authorId }],  // Set author to the news source (Ghost needs object format)
+      published_at: item.isoDate || new Date().toISOString(),
+      authors: [{ id: authorId }],
       tags: [
         { slug: "news" },
         { slug: feedSource.default_tag_slug || config.defaultTagSlug },
-        { slug: this.slugify(feedSource.name) }
+        { slug: this.slugify(feedSource.name) },
       ],
     };
 
@@ -212,37 +232,26 @@ export class FeedFetcher {
   }
 
   extractImageUrl(item) {
-    // Try media:thumbnail first
-    if (item.mediaThumbnail && item.mediaThumbnail.$ && item.mediaThumbnail.$.url) {
-      return item.mediaThumbnail.$.url;
-    }
+    if (item.mediaThumbnail?.$?.url) return item.mediaThumbnail.$.url;
 
-    // Try media:content
-    if (item.mediaContent && item.mediaContent.length > 0) {
+    if (item.mediaContent?.length > 0) {
       const media = item.mediaContent.find(m =>
         m.$ && (m.$.medium === "image" || (m.$.type && m.$.type.startsWith("image/")))
       );
-      if (media && media.$ && media.$.url) {
-        return media.$.url;
-      }
+      if (media?.$?.url) return media.$.url;
     }
 
-    // Try enclosure
-    if (item.enclosure && item.enclosure.url) {
+    if (item.enclosure?.url) {
       const type = item.enclosure.type || "";
       if (type.startsWith("image/") || /\.(jpg|jpeg|png|gif|webp)$/i.test(item.enclosure.url)) {
         return item.enclosure.url;
       }
     }
 
-    // Try to extract from content HTML - prioritize contentEncoded (full content) over content (summary)
     const contentHtml = item.contentEncoded || item["content:encoded"] || item.content || "";
     const imgMatch = contentHtml.match(/<img[^>]+src=["']([^"']+)["']/i);
-    if (imgMatch && imgMatch[1]) {
-      return imgMatch[1];
-    }
+    if (imgMatch?.[1]) return imgMatch[1];
 
-    // Try to extract YouTube thumbnail from embedded videos
     const youtubeMatch = contentHtml.match(/youtube\.com\/embed\/([a-zA-Z0-9_-]{11})|youtube\.com\/watch\?v=([a-zA-Z0-9_-]{11})|youtu\.be\/([a-zA-Z0-9_-]{11})/i);
     if (youtubeMatch) {
       const videoId = youtubeMatch[1] || youtubeMatch[2] || youtubeMatch[3];
@@ -253,111 +262,110 @@ export class FeedFetcher {
     return null;
   }
 
+  /**
+   * Fetch an image with manual redirect handling and per-hop SSRF revalidation,
+   * streaming the body so we can abort early if the server lies about size or
+   * serves something that isn't an image.
+   */
   async uploadImageToGhost(imageUrl) {
-    // SSRF protection: validate image URL before fetching
-    assertUrlSafe(imageUrl);
+    let currentUrl = imageUrl;
+    let response;
 
-    const response = await fetch(imageUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "image/*,*/*;q=0.8",
-        "Referer": new URL(imageUrl).origin,
-      },
-      redirect: "follow",
-      signal: AbortSignal.timeout(config.imageTimeout),
-    });
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+      await assertResolvedUrlSafe(currentUrl);
 
-    // SSRF protection: validate final URL after redirects
-    if (response.url !== imageUrl) {
-      const redirectCheck = validateUrl(response.url);
-      if (!redirectCheck.valid) {
-        throw new Error(`Redirect blocked: ${redirectCheck.reason}`);
+      response = await fetch(currentUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Accept": "image/*,*/*;q=0.8",
+          "Referer": new URL(currentUrl).origin,
+        },
+        redirect: "manual",
+        signal: AbortSignal.timeout(config.imageTimeout),
+      });
+
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        if (!location) throw new Error(`Redirect with no Location header (${response.status})`);
+        currentUrl = new URL(location, currentUrl).toString();
+        continue;
       }
+
+      break;
     }
 
+    if (response.status >= 300 && response.status < 400) {
+      throw new Error(`Too many redirects (>${MAX_REDIRECTS})`);
+    }
     if (!response.ok) {
       throw new Error(`Failed to download image: ${response.status}`);
     }
 
-    const contentType = response.headers.get("content-type") || "";
+    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    if (contentType.startsWith("image/svg")) {
+      throw new Error("SVG images rejected (XSS vector)");
+    }
     if (!contentType.startsWith("image/")) {
       throw new Error(`Not an image: ${contentType}`);
     }
 
-    const contentLength = response.headers.get("content-length");
-    if (contentLength && parseInt(contentLength) > config.maxImageSize) {
-      throw new Error("Image too large");
+    // Stream the body with a running size cap. Don't trust Content-Length —
+    // an attacker can lie about it or omit it.
+    const reader = response.body.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.length;
+        if (total > config.maxImageSize) {
+          await reader.cancel();
+          throw new Error(`Image too large (>${config.maxImageSize} bytes)`);
+        }
+        chunks.push(value);
+      }
+    } finally {
+      try { reader.releaseLock(); } catch {}
     }
 
-    const buffer = Buffer.from(await response.arrayBuffer());
-
-    if (buffer.length > config.maxImageSize) {
-      throw new Error("Image too large");
-    }
+    const buffer = Buffer.concat(chunks);
 
     if (buffer.length < 1000) {
       throw new Error("Image too small, likely an error page");
     }
 
-    const urlPath = new URL(imageUrl).pathname;
+    const sniffed = sniffImageType(buffer);
+    if (!sniffed) {
+      throw new Error("Buffer does not match a known image format");
+    }
+    if (sniffed === "svg") {
+      throw new Error("SVG images rejected (XSS vector)");
+    }
+
+    const urlPath = new URL(currentUrl).pathname;
     let filename = urlPath.split("/").pop() || "image.jpg";
     filename = filename.replace(/\?.*$/, "");
 
-    // Ensure filename has an extension
-    if (!/\.(jpg|jpeg|png|gif|webp|svg)$/i.test(filename)) {
-      const ext = contentType.split("/")[1] || "jpg";
-      filename = `image-${Date.now()}.${ext.replace("jpeg", "jpg")}`;
+    if (!/\.(jpg|jpeg|png|gif|webp)$/i.test(filename)) {
+      const ext = sniffed === "jpeg" ? "jpg" : sniffed;
+      filename = `image-${Date.now()}.${ext}`;
     }
 
     return await ghostClient.uploadImage(buffer, filename);
   }
 
-  decodeHtmlEntities(text) {
-    // Decode numeric entities (&#8230; &#38; etc)
-    text = text.replace(/&#(\d+);/g, (match, dec) => String.fromCharCode(dec));
-    // Decode hex entities (&#x2026; etc)
-    text = text.replace(/&#x([0-9a-fA-F]+);/g, (match, hex) => String.fromCharCode(parseInt(hex, 16)));
-    // Decode named entities
-    const entities = {
-      '&nbsp;': ' ',
-      '&amp;': '&',
-      '&lt;': '<',
-      '&gt;': '>',
-      '&quot;': '"',
-      '&apos;': "'",
-      '&ndash;': '-',
-      '&mdash;': '-',
-      '&lsquo;': "'",
-      '&rsquo;': "'",
-      '&ldquo;': '"',
-      '&rdquo;': '"',
-      '&hellip;': '...',
-      '&copy;': '(c)',
-      '&reg;': '(R)',
-      '&trade;': '(TM)',
-    };
-    for (const [entity, char] of Object.entries(entities)) {
-      text = text.split(entity).join(char);
-    }
-    return text;
-  }
-
   createExcerpt(content, maxLength = 300) {
     let text = content.replace(/<[^>]+>/g, " ");
-    text = this.decodeHtmlEntities(text);
+    text = decodeHTML(text);                    // entities lib — preserves em/en/curly chars
     text = text.replace(/\s+/g, " ").trim();
 
-    if (text.length <= maxLength) {
-      return text;
-    }
+    if (text.length <= maxLength) return text;
 
-    // Leave room for "..." suffix (Ghost limit is 300 chars)
     const truncateAt = maxLength - 3;
     text = text.substring(0, truncateAt);
     const lastSpace = text.lastIndexOf(" ");
-    if (lastSpace > truncateAt * 0.8) {
-      text = text.substring(0, lastSpace);
-    }
+    if (lastSpace > truncateAt * 0.8) text = text.substring(0, lastSpace);
 
     return text + "...";
   }
@@ -367,43 +375,98 @@ export class FeedFetcher {
     return crypto.createHash("sha256").update(content).digest("hex").substring(0, 32);
   }
 
+  /**
+   * Fetch + parse an RSS feed using curl (Node's fetch gets TLS-fingerprinted
+   * and blocked by Cloudflare/WAFs on some sites; curl passes through).
+   *
+   * We can't use curl `-L` because it follows redirects to anywhere. Instead
+   * we run with `--max-redirs 0` and follow manually, revalidating each hop
+   * and pinning the resolved IP via `--resolve` to close the TOCTOU window.
+   */
   async fetchAndParseFeed(url) {
-    // Use curl to fetch RSS — Node's HTTP stack gets TLS-fingerprinted and blocked
-    // by Cloudflare/WAFs on some sites, while curl passes through fine.
-    const { stdout } = await execFileAsync("curl", [
-      "-sS",
-      "-L",                    // follow redirects
-      "--max-time", "30",
-      "-H", "User-Agent: Ghost-RSS-Aggregator/1.1",
-      url,
-    ], { maxBuffer: 10 * 1024 * 1024 });
+    const body = await this._curlGetWithRevalidatedRedirects(url);
 
-    // Try rss-parser first (richer field extraction), fall back to htmlparser2
-    // for feeds with malformed XML that sax rejects
     try {
-      return await parser.parseString(stdout);
+      const feed = await parser.parseString(body);
+      if (feed.items?.length > MAX_FEED_ITEMS_PARSED) {
+        feed.items = feed.items.slice(0, MAX_FEED_ITEMS_PARSED);
+      }
+      return feed;
     } catch {
       console.log("  rss-parser failed, falling back to htmlparser2");
-      const feed = htmlParseFeed(stdout);
+      const feed = htmlParseFeed(body);
       if (!feed) throw new Error("Feed could not be parsed by either rss-parser or htmlparser2");
-      return {
-        items: (feed.items || []).map(item => ({
-          title: item.title,
-          link: item.link,
-          guid: item.id || item.link,
-          pubDate: item.pubDate?.toISOString?.() || item.pubDate,
-          isoDate: item.pubDate?.toISOString?.() || item.pubDate,
-          content: item.description || "",
-          contentSnippet: item.description?.replace(/<[^>]*>/g, "").substring(0, 300) || "",
-        })),
-      };
+      const items = (feed.items || []).slice(0, MAX_FEED_ITEMS_PARSED).map(item => ({
+        title: item.title,
+        link: item.link,
+        guid: item.id || item.link,
+        pubDate: item.pubDate?.toISOString?.() || item.pubDate,
+        isoDate: item.pubDate?.toISOString?.() || item.pubDate,
+        content: item.description || "",
+        contentSnippet: item.description?.replace(/<[^>]*>/g, "").substring(0, 300) || "",
+      }));
+      return { items };
     }
+  }
+
+  async _curlGetWithRevalidatedRedirects(url, hop = 0) {
+    if (hop > MAX_REDIRECTS) throw new Error(`Too many redirects (>${MAX_REDIRECTS})`);
+
+    const addresses = await assertResolvedUrlSafe(url);
+    const parsed = new URL(url);
+    const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+    // Pin to the first resolved address — closes the TOCTOU rebinding window.
+    // Prefer IPv4 if available (more reliable across hosts); fall back to IPv6.
+    const pinned = addresses.find(a => a.family === 4)?.address || addresses[0].address;
+
+    const args = [
+      "-sS",
+      "-i",                                                     // include response headers
+      "--max-redirs", "0",
+      "--max-time", "30",
+      "--max-filesize", String(MAX_FEED_BYTES),
+      "--resolve", `${parsed.hostname}:${port}:${pinned}`,
+      "-H", "User-Agent: Ghost-RSS-Aggregator/1.1",
+      url,
+    ];
+
+    let stdout;
+    try {
+      const result = await execFileAsync("curl", args, { maxBuffer: MAX_FEED_BYTES });
+      stdout = result.stdout;
+    } catch (e) {
+      // curl exits non-zero on 3xx-without-Location; we handle 3xx via -i header parse below
+      stdout = e.stdout || "";
+      if (!stdout) throw new Error(`curl failed: ${e.message}`);
+    }
+
+    // Parse status + headers + body. -i emits one header block per response;
+    // since we disabled redirects, there's exactly one block.
+    const splitIdx = stdout.indexOf("\r\n\r\n");
+    if (splitIdx === -1) throw new Error("Malformed response (no header/body split)");
+    const headerBlock = stdout.substring(0, splitIdx);
+    const body = stdout.substring(splitIdx + 4);
+
+    const statusMatch = headerBlock.match(/^HTTP\/[\d.]+\s+(\d+)/);
+    const status = statusMatch ? parseInt(statusMatch[1], 10) : 0;
+
+    if (status >= 300 && status < 400) {
+      const locMatch = headerBlock.match(/^location:\s*(.+)$/im);
+      if (!locMatch) throw new Error(`Redirect with no Location header (${status})`);
+      const next = new URL(locMatch[1].trim(), url).toString();
+      return this._curlGetWithRevalidatedRedirects(next, hop + 1);
+    }
+
+    if (status < 200 || status >= 300) {
+      throw new Error(`HTTP ${status} fetching feed`);
+    }
+
+    return body;
   }
 
   normalizeUrl(url) {
     try {
       const u = new URL(url);
-      // Remove trailing slash, fragment, and common tracking params
       u.hash = "";
       u.searchParams.delete("utm_source");
       u.searchParams.delete("utm_medium");
@@ -411,10 +474,7 @@ export class FeedFetcher {
       u.searchParams.delete("utm_content");
       u.searchParams.delete("utm_term");
       let normalized = u.toString();
-      // Remove trailing slash (but not for root paths)
-      if (normalized.endsWith("/") && u.pathname !== "/") {
-        normalized = normalized.slice(0, -1);
-      }
+      if (normalized.endsWith("/") && u.pathname !== "/") normalized = normalized.slice(0, -1);
       return normalized;
     } catch {
       return url;
@@ -422,11 +482,16 @@ export class FeedFetcher {
   }
 
   slugify(text) {
-    return text
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-|-$/g, "")
-      .substring(0, 50);
+    return text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").substring(0, 50);
+  }
+}
+
+/** http(s)-only check for canonical_url passed straight to Ghost. */
+function isSafeCanonicalLink(url) {
+  try {
+    return ["http:", "https:"].includes(new URL(url).protocol);
+  } catch {
+    return false;
   }
 }
 

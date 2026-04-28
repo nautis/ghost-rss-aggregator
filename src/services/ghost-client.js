@@ -42,6 +42,7 @@ export class GhostClient {
         Authorization: `Ghost ${token}`,
         "Content-Type": "application/json",
       },
+      signal: AbortSignal.timeout(30000),
     };
 
     if (data) {
@@ -92,6 +93,7 @@ export class GhostClient {
         "Content-Length": body.length.toString(),
       },
       body,
+      signal: AbortSignal.timeout(60000),
     });
 
     if (!response.ok) {

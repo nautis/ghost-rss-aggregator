@@ -1,6 +1,6 @@
 import jwt from "jsonwebtoken";
 import path from "path";
-import { validateUrl } from "./src/utils/url-validator.js";
+import { assertResolvedUrlSafe } from "./src/utils/url-validator.js";
 
 // Require environment variables - no hardcoded credentials
 const GHOST_URL = process.env.GHOST_URL;
@@ -14,6 +14,8 @@ if (!GHOST_URL || !GHOST_API_KEY) {
 }
 
 const [keyId, secret] = GHOST_API_KEY.split(":");
+const MAX_REDIRECTS = 3;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
 function generateToken() {
   return jwt.sign({}, Buffer.from(secret, "hex"), {
@@ -80,37 +82,37 @@ async function updatePost(postId, html, updatedAt) {
   return await response.json();
 }
 
-async function downloadImage(url) {
+async function downloadImage(url, hop = 0) {
   try {
-    // SSRF protection: validate URL before fetching
-    const urlCheck = validateUrl(url);
-    if (!urlCheck.valid) {
-      console.log(`    URL blocked: ${urlCheck.reason}`);
-      return null;
-    }
+    if (hop > MAX_REDIRECTS) return null;
+    await assertResolvedUrlSafe(url);
 
     const response = await fetch(url, {
       headers: {
         "User-Agent": "Mozilla/5.0 (compatible; GhostMigration/1.0)",
       },
+      redirect: "manual",
       signal: AbortSignal.timeout(30000),
     });
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) return null;
+      return downloadImage(new URL(location, url).toString(), hop + 1);
+    }
 
     if (!response.ok) {
       return null;
     }
 
-    // Validate final URL after redirects
-    if (response.url !== url) {
-      const redirectCheck = validateUrl(response.url);
-      if (!redirectCheck.valid) {
-        console.log(`    Redirect blocked: ${redirectCheck.reason}`);
-        return null;
-      }
-    }
-
     const contentType = response.headers.get("content-type") || "image/jpeg";
+    if (!contentType.toLowerCase().startsWith("image/")) {
+      return null;
+    }
     const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length > MAX_IMAGE_BYTES) {
+      return null;
+    }
     return { buffer, contentType };
   } catch (err) {
     return null;

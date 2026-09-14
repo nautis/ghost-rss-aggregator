@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/cli.js daemon",
     "cli": "node src/cli.js",
-    "fetch": "node src/cli.js fetch-all",
+    "fetch": "node src/cli.js fetch",
     "dev": "node --watch src/cli.js daemon"
   },
   "dependencies": {

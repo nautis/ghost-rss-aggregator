@@ -21,9 +21,6 @@ export class GhostClient {
       throw new Error("Ghost Admin API key not configured");
     }
 
-    const iat = Math.floor(Date.now() / 1000);
-    const exp = iat + 5 * 60; // 5 minutes
-
     return jwt.sign({}, this.secret, {
       keyid: this.keyId,
       algorithm: "HS256",
@@ -50,14 +47,26 @@ export class GhostClient {
     }
 
     const response = await fetch(url, options);
-    const responseData = await response.json();
+    const text = await response.text();
+    let responseData = null;
+
+    if (text) {
+      try {
+        responseData = JSON.parse(text);
+      } catch {
+        if (response.ok) {
+          return {};
+        }
+        throw new Error(`Ghost API error: ${response.status} ${text.substring(0, 300)}`);
+      }
+    }
 
     if (!response.ok) {
-      const errorMsg = responseData.errors?.[0]?.message || "Unknown error";
+      const errorMsg = responseData?.errors?.[0]?.message || response.statusText || "Unknown error";
       throw new Error(`Ghost API error: ${errorMsg}`);
     }
 
-    return responseData;
+    return responseData || {};
   }
 
   async createPost(postData) {

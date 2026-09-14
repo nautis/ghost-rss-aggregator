@@ -73,6 +73,7 @@ export class FeedFetcher {
 
   async fetchFeed(feedSource) {
     console.log(`\nFetching: ${feedSource.name} (${feedSource.feed_url})`);
+    this.backfillNormalizedImportedUrls();
 
     const logStmt = db.prepare(
       "INSERT INTO fetch_logs (feed_source_id, started_at, status) VALUES (?, datetime('now'), 'running')"
@@ -93,12 +94,12 @@ export class FeedFetcher {
       const authorId = await this.ensureAuthor(feedSource.name);
 
       const existingUrls = new Set(
-        db.prepare("SELECT item_url FROM imported_items")
+        db.prepare("SELECT item_url, normalized_item_url FROM imported_items")
           .all()
-          .map(row => this.normalizeUrl(row.item_url))
+          .map(row => row.normalized_item_url || this.normalizeUrl(row.item_url))
       );
 
-      // Local DB is the source of truth for dedup (unique index on item_url).
+      // Local DB is the source of truth for dedup (unique index on normalized_item_url).
       // We no longer pull every Ghost post tagged 'news' — that grew O(n) per cycle.
 
       for (const item of items) {
@@ -127,30 +128,29 @@ export class FeedFetcher {
             }
           }
 
-          const ghostPost = await this.importItem(item, feedSource, authorId);
-          if (ghostPost) {
-            try {
-              db.prepare(`
-                INSERT INTO imported_items
-                (feed_source_id, item_guid, item_url, content_hash, ghost_post_id, original_title, original_pub_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-              `).run(
-                feedSource.id,
-                item.guid || null,
-                itemUrl,
-                this.hashContent(item),
-                ghostPost.id,
-                item.title,
-                item.pubDate || item.isoDate || null
-              );
-            } catch (insertErr) {
-              // UNIQUE violation = race with concurrent fetch; not fatal
-              if (!insertErr.message?.includes("UNIQUE")) throw insertErr;
-            }
+          const reservation = this.reserveImportedItem(feedSource, item, itemUrl, normalizedUrl);
+          if (!reservation) {
+            existingUrls.add(normalizedUrl);
+            itemsSkipped++;
+            continue;
+          }
 
+          let ghostPost;
+          try {
+            ghostPost = await this.importItem(item, feedSource, authorId);
+          } catch (importError) {
+            this.releaseReservedItem(reservation.id, importError);
+            throw importError;
+          }
+
+          if (ghostPost) {
+            this.completeImportedItem(reservation.id, ghostPost.id);
             existingUrls.add(normalizedUrl);
             itemsImported++;
             console.log(`  Imported: ${item.title?.substring(0, 50)}...`);
+          } else {
+            this.releaseReservedItem(reservation.id, new Error("Ghost post was not created"));
+            itemsSkipped++;
           }
         } catch (itemError) {
           console.error(`  Error importing item: ${itemError.message}`);
@@ -197,10 +197,9 @@ export class FeedFetcher {
         console.log(`    Image uploaded: ${featureImageUrl}`);
       } catch (imgError) {
         console.log(`    Image failed: ${imgError.message}`);
-        // Fallback: only re-use the original URL if we already validated its scheme
-        // and it's HTTPS. This means hot-linking, which we accept as a documented
-        // tradeoff vs. losing the image.
-        if (imageUrl.startsWith("https://")) {
+        // Fallback means hot-linking. Only allow it after the original URL passes
+        // the same async SSRF validation, and never after content validation fails.
+        if (await this.canUseOriginalImageFallback(imageUrl, imgError)) {
           featureImageUrl = imageUrl;
           console.log(`    Using original image URL as fallback`);
         }
@@ -229,6 +228,87 @@ export class FeedFetcher {
     };
 
     return await ghostClient.createPost(postData);
+  }
+
+  backfillNormalizedImportedUrls() {
+    db.prepare(`
+      DELETE FROM imported_items
+      WHERE import_status = 'pending'
+        AND ghost_post_id IS NULL
+        AND imported_at < datetime('now', '-6 hours')
+    `).run();
+
+    const rows = db.prepare(`
+      SELECT id, item_url FROM imported_items
+      WHERE normalized_item_url IS NULL OR normalized_item_url = ''
+      LIMIT 500
+    `).all();
+
+    const stmt = db.prepare("UPDATE imported_items SET normalized_item_url = ? WHERE id = ?");
+    for (const row of rows) {
+      try {
+        stmt.run(this.normalizeUrl(row.item_url), row.id);
+      } catch (error) {
+        if (!error.message?.includes("UNIQUE")) throw error;
+      }
+    }
+  }
+
+  reserveImportedItem(feedSource, item, itemUrl, normalizedUrl) {
+    try {
+      const result = db.prepare(`
+        INSERT INTO imported_items
+        (feed_source_id, item_guid, item_url, normalized_item_url, content_hash, original_title, original_pub_date, import_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+      `).run(
+        feedSource.id,
+        item.guid || null,
+        itemUrl,
+        normalizedUrl,
+        this.hashContent(item),
+        item.title,
+        item.pubDate || item.isoDate || null
+      );
+      return { id: result.lastInsertRowid };
+    } catch (error) {
+      if (error.message?.includes("UNIQUE")) return null;
+      throw error;
+    }
+  }
+
+  completeImportedItem(importedItemId, ghostPostId) {
+    db.prepare(`
+      UPDATE imported_items
+      SET ghost_post_id = ?, import_status = 'imported', last_error = NULL
+      WHERE id = ?
+    `).run(ghostPostId, importedItemId);
+  }
+
+  releaseReservedItem(importedItemId, error) {
+    db.prepare("DELETE FROM imported_items WHERE id = ? AND import_status = 'pending' AND ghost_post_id IS NULL").run(importedItemId);
+    if (error) {
+      console.log(`    Released import reservation: ${error.message}`);
+    }
+  }
+
+  async canUseOriginalImageFallback(imageUrl, error) {
+    const validationFailure = /SSRF blocked|SVG images rejected|Not an image|Buffer does not match|Image too large/i;
+    if (!imageUrl || validationFailure.test(error.message || "")) return false;
+
+    let parsed;
+    try {
+      parsed = new URL(imageUrl);
+    } catch {
+      return false;
+    }
+    if (parsed.protocol !== "https:") return false;
+
+    try {
+      await assertResolvedUrlSafe(imageUrl);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   extractImageUrl(item) {
@@ -432,12 +512,16 @@ export class FeedFetcher {
 
     let stdout;
     try {
-      const result = await execFileAsync("curl", args, { maxBuffer: MAX_FEED_BYTES });
+      const result = await execFileAsync("curl", args, { maxBuffer: MAX_FEED_BYTES + 64 * 1024 });
       stdout = result.stdout;
     } catch (e) {
-      // curl exits non-zero on 3xx-without-Location; we handle 3xx via -i header parse below
       stdout = e.stdout || "";
-      if (!stdout) throw new Error(`curl failed: ${e.message}`);
+      const status = this.extractCurlStatus(stdout);
+      if (status < 300 || status >= 400) {
+        throw new Error(`curl failed: ${e.message}`);
+      }
+      // Some curl builds return non-zero for redirect responses when redirects
+      // are disabled. We only keep parsing for that narrow case.
     }
 
     // Parse status + headers + body. -i emits one header block per response;
@@ -462,6 +546,14 @@ export class FeedFetcher {
     }
 
     return body;
+  }
+
+  extractCurlStatus(stdout) {
+    if (!stdout) return 0;
+    const splitIdx = stdout.indexOf("\r\n\r\n");
+    const headerBlock = splitIdx === -1 ? stdout : stdout.substring(0, splitIdx);
+    const statusMatch = headerBlock.match(/^HTTP\/[\d.]+\s+(\d+)/);
+    return statusMatch ? parseInt(statusMatch[1], 10) : 0;
   }
 
   normalizeUrl(url) {

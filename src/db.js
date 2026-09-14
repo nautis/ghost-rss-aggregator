@@ -52,7 +52,10 @@ db.exec(`
     -- Deduplication keys
     item_guid TEXT,
     item_url TEXT NOT NULL,
+    normalized_item_url TEXT,
     content_hash TEXT,
+    import_status TEXT DEFAULT "imported",
+    last_error TEXT,
     
     -- Ghost reference
     ghost_post_id TEXT,
@@ -86,6 +89,21 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_fetch_logs_source ON fetch_logs(feed_source_id, started_at DESC);
+`);
+
+const columns = db.prepare("PRAGMA table_info(imported_items)").all().map(row => row.name);
+if (!columns.includes("normalized_item_url")) {
+  db.exec("ALTER TABLE imported_items ADD COLUMN normalized_item_url TEXT");
+}
+if (!columns.includes("import_status")) {
+  db.exec("ALTER TABLE imported_items ADD COLUMN import_status TEXT DEFAULT 'imported'");
+}
+if (!columns.includes("last_error")) {
+  db.exec("ALTER TABLE imported_items ADD COLUMN last_error TEXT");
+}
+
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_imported_items_normalized_url ON imported_items(normalized_item_url) WHERE normalized_item_url IS NOT NULL;
 `);
 
 export default db;
